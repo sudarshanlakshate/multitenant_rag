@@ -1,0 +1,35 @@
+[project]
+name = "rag"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "alembic>=1.20.0",
+    "beautifulsoup4>=4.15.0",
+    "chromadb>=1.5.9",
+    "langchain>=1.4.2",
+    "langchain-chroma>=1.1.0",
+    "langchain-community>=0.4.2",
+    "langchain-core>=1.6.5",
+    "langchain-openai>=1.6.6",
+    "langchain-text-splitters>=1.1.2",
+    "langsmith>=0.14.1",
+    "openai>=3.19.2",
+    "pip>=26.2.1",
+    "psycopg[binary]>=3.3.6",
+    "pydantic-settings>=2.15.0",
+    "pypdf>=6.19.0",
+    "python-dotenv>=1.2.3",
+    "sqlalchemy>=2.1.1",
+    "streamlit[auth]>=1.64.0",
+    "tiktoken>=0.14.0",
+    "pytest>=8.0.0",
+]
+
+[tool.pytest.ini_options]
+# Make the project root importable so `from src.xxx import ...` works in tests.
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-ra --ignore=tests/test_chroma.py --ignore=tests/test_db.py --ignore=tests/collection.py"
+
