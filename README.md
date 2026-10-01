@@ -143,7 +143,7 @@ pytest
 
 ## Roadmap / known gaps
 
-This is a reference implementation, not a production-hardened service. Honest gaps versus the leaders:
+This is a reference implementation, not a production-hardened service. we are workiing on it  Honest gaps versus the leaders:
 
 - **Document parsing**: pypdf text only. No OCR, no table extraction, no layout awareness. Add Docling or DeepDoc for tables and scanned PDFs.
 - **Reranking**: lexical heuristic, not a learned cross-encoder. Swap in `bge-reranker`, Cohere, or Jina.
