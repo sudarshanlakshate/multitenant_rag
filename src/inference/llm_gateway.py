@@ -45,6 +45,27 @@ class LLMGateway:
         self.openai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
         self.openai_api_key = os.getenv("OPENAI_API_KEY")
 
+    def _vllm_healthy(self) -> bool:
+        """Return True only when the vLLM endpoint actually answers.
+
+        ChatOpenAI(...) construction does not open a connection, so relying
+        on the constructor to detect a dead vLLM silently never falls back.
+        This pings the /health endpoint before we trust the provider.
+        """
+        if not self.vllm_enabled:
+            return False
+
+        import urllib.request
+        import urllib.error
+
+        health_url = f"{self.vllm_base_url.rstrip('/v1')}/health"
+        req = urllib.request.Request(health_url, method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=3.0) as response:
+                return response.status < 400
+        except Exception:
+            return False
+
     def get_llm(self, temperature: float = 0.0, max_tokens: int = 1024) -> tuple[BaseChatModel, str]:
         """
         Return the primary LLM instance and provider label.
@@ -53,9 +74,8 @@ class LLMGateway:
             (llm_instance, provider_name)
         """
         if self.vllm_enabled:
-            logger.info("Attempting inference via vLLM endpoint: %s (model: %s)", self.vllm_base_url, self.vllm_model)
-            try:
-                # vLLM provides an OpenAI-compatible /v1 API
+            if self._vllm_healthy():
+                logger.info("Using vLLM endpoint: %s (model: %s)", self.vllm_base_url, self.vllm_model)
                 vllm_llm = ChatOpenAI(
                     model=self.vllm_model,
                     base_url=self.vllm_base_url,
@@ -65,12 +85,12 @@ class LLMGateway:
                     timeout=30.0,
                 )
                 return vllm_llm, f"vLLM ({self.vllm_model})"
-            except Exception as exc:
-                logger.warning(
-                    "vLLM failed to initialize (%s). Falling back to OpenAI (%s)",
-                    exc,
-                    self.openai_model,
-                )
+
+            logger.warning(
+                "vLLM enabled but unreachable at %s. Falling back to OpenAI (%s)",
+                self.vllm_base_url,
+                self.openai_model,
+            )
 
         # Fallback to OpenAI
         openai_llm = ChatOpenAI(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 import time
 from typing import Any
@@ -20,6 +21,10 @@ from src.query.query_router_rrf import (
     SearchResult,
     reciprocal_rank_fusion,
 )
+from src.query.query_translation import (
+    QueryTranslationService,
+    QueryTranslationStrategy,
+)
 from src.query.reranker import reranker
 from src.security.sanitizer import redact_pii, validate_input_query
 
@@ -35,6 +40,10 @@ DEFAULT_PROMPT = ChatPromptTemplate.from_messages(
             "Use the provided context to answer the question accurately and concisely. "
             "If the provided context does not contain enough information to answer, state clearly "
             "that the documents do not provide this information. Do not make up facts.\n\n"
+            "Each context block is labeled [n] and carries a source, page, and section. "
+            "When a claim is supported by a block, cite it inline as [n]. "
+            "If the answer combines several blocks, cite each one. "
+            "If no block supports a claim, do not make the claim.\n\n"
             "Context:\n{context}",
         ),
         ("human", "{question}"),
@@ -118,8 +127,14 @@ def _get_tenant_bm25(tenant_id: str, chroma: Chroma) -> BM25Retriever | None:
 
 def decompose_query(query: str) -> list[str]:
     """
-    Decompose compound queries and expand terms to prevent single-vector blindness.
-    Handles multiple questions, conjunctions, and vocabulary differences (e.g. salary vs CTC).
+    Decompose compound queries and expand terms to prevent single-vector
+    blindness.
+
+    This is a lightweight deterministic fallback that handles compound
+    questions (split on '?', ' and ', ' as well as '). The full
+    QueryTranslationService (seven strategies: compress, expand, rephrase,
+    multi_query, decompose, step_back, hyde) is the production path and is
+    wired in via `run_query_translation()` below.
     """
     variants = [query.strip()]
 
@@ -139,19 +154,85 @@ def decompose_query(query: str) -> list[str]:
             if len(clean) > 2 and clean not in variants:
                 variants.append(clean)
 
-    # 3. Add synonym expansions for common vocabulary variations
-    lower_q = query.lower()
-    if any(k in lower_q for k in ["salary", "package", "ctc", "pay", "compensation"]):
-        variants.append("annual CTC salary compensation package breakdown")
-    if any(k in lower_q for k in ["name", "who am i", "candidate"]):
-        variants.append("Candidate employee Name")
-
     return list(dict.fromkeys(variants))
+
+
+def run_query_translation(query: str) -> list[str]:
+    """
+    Run the production QueryTranslationService (seven strategies) against the
+    user query and return the flattened list of variant texts for retrieval.
+
+    Falls back to the deterministic `decompose_query` when no translation
+    model is configured (e.g. no Ollama host reachable), so the pipeline never
+    hard-fails on a missing model.
+    """
+    try:
+        from src.inference.llm_gateway import llm_gateway
+
+        ollama_model = os.getenv("OLLAMA_TRANSLATION_MODEL", "qwen2.5:7b-instruct")
+        ollama_base = os.getenv("OLLAMA_TRANSLATION_BASE_URL", "http://localhost:11434")
+
+        from src.query.query_translation import (
+            OllamaTranslationModel,
+            QueryTranslationService,
+            QueryTranslationStrategy,
+        )
+
+        model = OllamaTranslationModel(
+            model=ollama_model,
+            base_url=ollama_base,
+            timeout_seconds=float(os.getenv("OLLAMA_TRANSLATION_TIMEOUT", "30.0")),
+        )
+        service = QueryTranslationService(model=model)
+
+        strategies = (
+            QueryTranslationStrategy.MULTI_QUERY,
+            QueryTranslationStrategy.DECOMPOSE,
+            QueryTranslationStrategy.EXPAND,
+        )
+        results = service.translate_many(query, strategies)
+
+        variants: list[str] = []
+        for result in results:
+            for variant in result.variants:
+                if variant.text and variant.text not in variants:
+                    variants.append(variant.text)
+
+        if variants:
+            return variants
+    except Exception as exc:
+        logger.debug("Query translation skipped (%s); using deterministic fallback", exc)
+
+    return decompose_query(query)
 
 
 def format_docs(docs: list[Document]) -> str:
     """Concatenate retrieved document chunks into clean delimited context string."""
     return "\n\n---\n\n".join(doc.page_content for doc in docs)
+
+
+def format_docs_with_citations(docs: list[Document]) -> str:
+    """Concatenate retrieved chunks with inline citation labels.
+
+    Each block is prefixed with a numeric label and annotated with its
+    source, page, and section so the model can cite it and the UI can
+    render clickable source links.
+    """
+    blocks: list[str] = []
+    for idx, doc in enumerate(docs, start=1):
+        source = doc.metadata.get("source", "Unknown Document")
+        page = doc.metadata.get("page")
+        section = doc.metadata.get("section_path")
+
+        header_parts = [f"[{idx}] {source}"]
+        if page is not None:
+            header_parts.append(f"page {page}")
+        if section:
+            header_parts.append(f"section: {section}")
+
+        blocks.append(" ".join(header_parts) + "\n" + doc.page_content.strip())
+
+    return "\n\n---\n\n".join(blocks)
 
 
 def query_tenant_rag(
@@ -195,7 +276,7 @@ def query_tenant_rag(
     retrieved_candidates: list[Document] = []
 
     try:
-        variants = decompose_query(query)
+        variants = run_query_translation(query)
         dense_results: list[SearchResult] = []
         dense_seen: set[str] = set()
 
@@ -210,10 +291,19 @@ def query_tenant_rag(
                     dense_seen.add(doc_key)
                     # Convert distance to similarity score
                     score = 1.0 / (1.0 + max(0.0, dist))
+                    # Use the Chroma point ID (per-chunk), NOT the document_id.
+                    # RRF merges by document.id, so dense and BM25 must share
+                    # the same ID namespace. Using document_id collapses every
+                    # dense chunk from one document into a single fused entry
+                    # and prevents dense/BM25 hits on the same chunk from
+                    # combining.
+                    point_id = doc.metadata.get("chunk_id") or doc.metadata.get(
+                        "document_id", f"dense_{rank_pos}"
+                    )
                     dense_results.append(
                         SearchResult(
                             document=RouterDocument(
-                                id=doc.metadata.get("document_id", f"dense_{rank_pos}"),
+                                id=point_id,
                                 text=doc.page_content,
                                 metadata=doc.metadata,
                             ),
@@ -298,8 +388,43 @@ def query_tenant_rag(
             final_docs.insert(0, top_dense)
             final_scores.insert(0, 0.0)
 
+    # Relevance threshold: refuse to answer from weak context instead of
+    # fabricating. The threshold is configurable via the environment and
+    # defaults to a conservative 0.0 (never refuse) so existing behaviour is
+    # preserved unless explicitly opted in.
+    try:
+        relevance_threshold = float(os.getenv("RAG_RELEVANCE_THRESHOLD", "0.0"))
+    except ValueError:
+        relevance_threshold = 0.0
+
+    best_score = max(final_scores) if final_scores else 0.0
+    if relevance_threshold > 0.0 and best_score < relevance_threshold:
+        logger.info(
+            "Query rejected by relevance threshold: best_score=%.3f threshold=%.3f",
+            best_score, relevance_threshold,
+        )
+        return {
+            "answer": (
+                "The retrieved documents do not contain enough relevant "
+                "information to answer this question. Please rephrase or "
+                "upload additional documents."
+            ),
+            "sources": [],
+            "query": query,
+            "chunks_found": 0,
+            "retrieval_mode": "hybrid_rrf_rerank",
+            "retrieval_time_ms": retrieval_time_ms,
+            "rerank_time_ms": rerank_time_ms,
+            "inference_time_ms": 0.0,
+            "total_time_ms": round(retrieval_time_ms + rerank_time_ms, 2),
+            "llm_provider": "none",
+            "relevance_score": best_score,
+        }
+
     # 3. Inference Phase via LLM Gateway (vLLM / OpenAI)
-    context = format_docs(final_docs)
+    # Build context with inline citations so the model can reference sources,
+    # and so the returned sources carry page numbers for the UI.
+    context = format_docs_with_citations(final_docs)
     prompt = _get_prompt()
     llm, provider_name = llm_gateway.get_llm(temperature=0.0)
 
@@ -324,6 +449,8 @@ def query_tenant_rag(
             {
                 "source": doc.metadata.get("source", "Unknown Document"),
                 "chunk_index": doc.metadata.get("chunk_index", idx),
+                "page": doc.metadata.get("page"),
+                "section_path": doc.metadata.get("section_path"),
                 "distance": r_score,
                 "character_count": len(content),
                 "preview": preview,

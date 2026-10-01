@@ -23,7 +23,7 @@ from langchain_openai import OpenAIEmbeddings
 from src.db.models import Chunk, Document, DocumentVersion
 from src.db.session import SessionLocal
 
-from src.ingestion.chunking.splitter import chunk_text
+from src.ingestion.chunking.splitter import StructuredChunk, chunk_text
 from src.ingestion.loaders.html import parse_html
 from src.ingestion.loaders.office import parse_office
 from src.ingestion.loaders.pdf import parse_pdf
@@ -430,7 +430,7 @@ def _persist_document_metadata(
     document_id: str,
     filename: str,
     content_hash: str,
-    chunks: list[str],
+    chunks: list[StructuredChunk],
     source_type: str,
     file_type: str,
     user_id: str | None,
@@ -562,12 +562,12 @@ def _persist_document_metadata(
     # 6. Create PostgreSQL chunk records
     # --------------------------------------------------------
 
-    for index, chunk_text_value in enumerate(
+    for index, chunk in enumerate(
         chunks
     ):
 
         chunk_hash = calculate_chunk_hash(
-            chunk_text_value
+            chunk.text
         )
 
         chunk = Chunk(
@@ -575,11 +575,12 @@ def _persist_document_metadata(
             document_id=document_uuid,
             version=next_version,
             chunk_index=index,
-            text=chunk_text_value,
+            text=chunk.text,
             chunk_hash=chunk_hash,
-            section_path=None,
-            char_start=None,
-            char_end=None,
+            section_path=chunk.section_path,
+            page=chunk.page,
+            char_start=chunk.char_start,
+            char_end=chunk.char_end,
             document_metadata={
                 "filename": filename,
                 "source_type": source_type,
@@ -803,7 +804,11 @@ def process_file(
             "chunks": [
                 {
                     "chunk_index": index,
-                    "text": chunk,
+                    "text": chunk.text,
+                    "page": chunk.page,
+                    "section_path": chunk.section_path,
+                    "char_start": chunk.char_start,
+                    "char_end": chunk.char_end,
                 }
                 for index, chunk in enumerate(
                     chunks
@@ -945,7 +950,7 @@ def process_file(
 
             lc_documents.append(
                 LCDocument(
-                    page_content=chunk,
+                    page_content=chunk.text,
                     metadata={
                         "tenant_id": tenant_id,
                         "user_id": user_id or "",
@@ -957,6 +962,13 @@ def process_file(
                         "source_type": source_type,
                         "file_type": path.suffix.lower(),
                         "content_hash": content_hash,
+                        # Stable per-chunk point ID. RRF merges by this key,
+                        # so dense and BM25 must share the same ID namespace.
+                        "chunk_id": point_id,
+                        "page": chunk.page,
+                        "section_path": chunk.section_path,
+                        "char_start": chunk.char_start,
+                        "char_end": chunk.char_end,
                     },
                 )
             )

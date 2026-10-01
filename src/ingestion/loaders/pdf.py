@@ -4,9 +4,20 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+# Internal page delimiter. It is a control character that never appears in
+# normal PDF text, so it survives the chunker and is stripped before any
+# text is shown to a user or an LLM.
+_PAGE_SEP = "\x00PAGE\x00"
+
+
 def parse_pdf(file_path: str) -> str:
     """
-    Extract text from a text-based PDF.
+    Extract text from a text-based PDF, preserving page boundaries.
+
+    The returned string embeds ``\\x00PAGE\\x00`` markers between pages so
+    the chunker can recover per-page metadata (page numbers, character
+    offsets). The markers are stripped before any text reaches a user or an
+    LLM.
 
     Uses pypdf first and pdfplumber as a fallback for pages where pypdf
     returns no text. OCR is intentionally not hidden inside this function;
@@ -47,30 +58,28 @@ def parse_pdf(file_path: str) -> str:
             except Exception:
                 logger.exception(
                     "pdfplumber fallback failed: filename=%s blank_pages=%s",
-                    file_path,
-                    blank_pages,
+                    file_path, blank_pages,
                 )
 
-        # Preserve original page order.
-        full_text = "\n\n".join(
-            text_by_page[page_number]
+        # Preserve original page order, separated by the page marker so the
+        # chunker can recover page numbers and offsets.
+        page_blocks = [
+            f"{_PAGE_SEP}{page_number}{_PAGE_SEP}{text_by_page[page_number]}"
             for page_number in range(1, total_pages + 1)
             if page_number in text_by_page
-        )
+        ]
+        full_text = "\n\n".join(page_blocks)
 
         if not full_text.strip():
             logger.warning(
                 "No text extracted; document may be image/scanned PDF: "
                 "filename=%s pages=%d",
-                file_path,
-                total_pages,
+                file_path, total_pages,
             )
 
         logger.info(
             "PDF parsed: filename=%s pages=%d extracted_characters=%d",
-            file_path,
-            total_pages,
-            len(full_text),
+            file_path, total_pages, len(full_text),
         )
 
         return full_text.strip()

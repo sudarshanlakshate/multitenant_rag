@@ -394,6 +394,11 @@ class Chunk(Base):
         nullable=True,
     )
 
+    page: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+    )
+
     char_start: Mapped[int | None] = mapped_column(
         Integer,
         nullable=True,

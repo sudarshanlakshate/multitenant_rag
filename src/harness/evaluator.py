@@ -69,9 +69,19 @@ RELEVANCE_PROMPT = ChatPromptTemplate.from_messages(
 
 
 def _parse_score(text: str) -> tuple[float, str]:
-    """Parse SCORE and EXPLANATION from LLM judge response."""
+    """Parse SCORE and EXPLANATION from LLM judge response.
+
+    Raises ValueError when the judge output cannot be parsed, so callers
+    fail loudly instead of silently accepting a default score that inflates
+    results.
+    """
     score_match = re.search(r"SCORE:\s*([0-9]*\.?[0-9]+)", text)
-    score = float(score_match.group(1)) if score_match else 0.8
+    if score_match is None:
+        raise ValueError(
+            "Judge response missing SCORE field: %r" % text[:200]
+        )
+
+    score = float(score_match.group(1))
     score = max(0.0, min(1.0, score))
 
     exp_match = re.search(r"EXPLANATION:\s*(.+)", text, re.DOTALL)
@@ -96,21 +106,13 @@ class RAGEvaluator:
 
         # 1. Evaluate Faithfulness
         faith_chain = FAITHFULNESS_PROMPT | self.llm | StrOutputParser()
-        try:
-            faith_raw = faith_chain.invoke({"context": full_context, "answer": answer})
-            faith_score, faith_reason = _parse_score(faith_raw)
-        except Exception as exc:
-            logger.warning("Faithfulness evaluation failed: %s", exc)
-            faith_score, faith_reason = 1.0, "Evaluator fallback"
+        faith_raw = faith_chain.invoke({"context": full_context, "answer": answer})
+        faith_score, faith_reason = _parse_score(faith_raw)
 
         # 2. Evaluate Answer Relevance
         rel_chain = RELEVANCE_PROMPT | self.llm | StrOutputParser()
-        try:
-            rel_raw = rel_chain.invoke({"question": query, "answer": answer})
-            rel_score, rel_reason = _parse_score(rel_raw)
-        except Exception as exc:
-            logger.warning("Answer relevance evaluation failed: %s", exc)
-            rel_score, rel_reason = 1.0, "Evaluator fallback"
+        rel_raw = rel_chain.invoke({"question": query, "answer": answer})
+        rel_score, rel_reason = _parse_score(rel_raw)
 
         # 3. Context Relevance (Heuristic density of query terms in retrieved context)
         query_words = set(re.findall(r"\w+", query.lower()))

@@ -13,10 +13,19 @@ from sqlalchemy import create_engine, pool
 # MAKE PROJECT ROOT IMPORTABLE
 # ============================================================
 
-# alembic/env.py lives in <project_root>/alembic/, so parents[1] resolves
-# to the project root. This allows:
-#     from src.db.models import Base
-# to work when running alembic from the project root.
+# alembic/env.py lives here:
+#
+# C:\DailyLearning\Day2\alembic\env.py
+#
+# parents[1] gives:
+#
+# C:\DailyLearning\Day2
+#
+# This allows:
+#
+# from src.db.models import Base
+#
+# to work.
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 

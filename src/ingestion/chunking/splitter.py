@@ -2,8 +2,24 @@ from __future__ import annotations
 
 import logging
 import re
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
+
+
+# Matches the page marker emitted by the PDF loader: \x00PAGE\x00<n>\x00PAGE\x00
+_PAGE_MARKER_RE = re.compile(r"\x00PAGE\x00(\d+)\x00PAGE\x00")
+
+
+@dataclass
+class StructuredChunk:
+    """A chunk with the metadata leaders expect: page, section, offsets."""
+
+    text: str
+    page: int | None
+    section_path: str | None
+    char_start: int
+    char_end: int
 
 
 def _split_long_text(text: str, chunk_size: int, overlap: int) -> list[str]:
@@ -51,17 +67,28 @@ def _extract_header(line: str) -> str | None:
     return None
 
 
+def _strip_page_markers(text: str) -> str:
+    """Remove page markers from chunk text before it reaches a user or LLM."""
+    return _PAGE_MARKER_RE.sub("", text).strip()
+
+
 def chunk_text(
     text: str,
     chunk_size: int = 500,
     overlap: int = 50,
     preserve_structure: bool = True,
-) -> list[str]:
+) -> list[StructuredChunk]:
     """
-    Enterprise Structure-Aware Chunker:
-    - Maintains document and markdown section headers.
-    - Preserves table rows and paragraphs intact.
-    - Adds bounded context overlap across chunk boundaries.
+    Enterprise Structure-Aware Chunker producing structured chunks.
+
+    Each chunk carries:
+      - page: the source page number (1-based), or None for non-PDF sources
+      - section_path: the most recent section heading seen, or None
+      - char_start / char_end: offsets into the original document text
+
+    Page markers (``\\x00PAGE<n>\\x00``) emitted by the PDF loader are
+    consumed here to track page boundaries and are stripped from the chunk
+    text itself.
     """
     if chunk_size <= 0:
         raise ValueError("chunk_size must be > 0")
@@ -73,14 +100,44 @@ def chunk_text(
     if not normalized:
         return []
 
-    # Split on double newlines while tracking sections
     raw_paragraphs = [p for p in re.split(r"\n\s*\n+", normalized) if p.strip()]
 
-    chunks: list[str] = []
+    chunks: list[StructuredChunk] = []
     current_chunk = ""
     current_section = ""
+    current_page: int | None = None
+    chunk_page: int | None = None
+    chunk_start_offset = 0
+    running_offset = 0
+
+    def _flush() -> None:
+        nonlocal current_chunk, current_section, current_page, chunk_page, chunk_start_offset
+        body = _strip_page_markers(current_chunk)
+        if body:
+            chunks.append(
+                StructuredChunk(
+                    text=body,
+                    page=chunk_page,
+                    section_path=current_section or None,
+                    char_start=chunk_start_offset,
+                    char_end=chunk_start_offset + len(body),
+                )
+            )
+        current_chunk = ""
+        chunk_start_offset = running_offset
 
     for paragraph in raw_paragraphs:
+        # Detect page markers at the start of the paragraph.
+        page_match = _PAGE_MARKER_RE.match(paragraph)
+        if page_match:
+            current_page = int(page_match.group(1))
+            # Record the page only when this is the first paragraph of a
+            # new chunk. A chunk that spans multiple pages is labeled with
+            # its starting page, which is the most useful citation anchor.
+            if not current_chunk:
+                chunk_page = current_page
+            paragraph = paragraph[page_match.end():].lstrip()
+
         # Check if this paragraph contains a section header
         lines = paragraph.split("\n")
         first_line_header = _extract_header(lines[0])
@@ -90,44 +147,59 @@ def chunk_text(
         # Check for oversized paragraph
         if len(paragraph) > chunk_size:
             if current_chunk.strip():
-                chunks.append(current_chunk.strip())
-                current_chunk = ""
+                _flush()
 
             sub_chunks = _split_long_text(paragraph, chunk_size, overlap)
-            # Prepend section breadcrumb to long split chunks if available
             for sc in sub_chunks:
-                if current_section and not sc.startswith(f"[{current_section}]") and len(sc) + len(current_section) + 5 <= chunk_size:
-                    chunks.append(f"[{current_section}]\n{sc}")
-                else:
-                    chunks.append(sc)
+                chunks.append(
+                    StructuredChunk(
+                        text=_strip_page_markers(sc),
+                        page=current_page,
+                        section_path=current_section or None,
+                        char_start=running_offset,
+                        char_end=running_offset + len(sc),
+                    )
+                )
+            running_offset += len(paragraph) + 2
             continue
 
         candidate = f"{current_chunk}\n\n{paragraph}".strip() if current_chunk else paragraph
 
         if len(candidate) <= chunk_size:
+            if not current_chunk:
+                chunk_start_offset = running_offset
+                chunk_page = current_page
             current_chunk = candidate
         else:
             if current_chunk.strip():
-                chunks.append(current_chunk.strip())
+                _flush()
 
             # Start next chunk with overlap from previous chunk
             if overlap and chunks:
-                prefix = chunks[-1][-overlap:].strip()
+                prefix = chunks[-1].text[-overlap:].strip()
                 current_chunk = f"{prefix}\n\n{paragraph}".strip()
+                chunk_start_offset = running_offset
+                chunk_page = current_page
                 if len(current_chunk) > chunk_size:
                     current_chunk = paragraph
+                    chunk_start_offset = running_offset
+                    chunk_page = current_page
             else:
                 current_chunk = paragraph
+                chunk_start_offset = running_offset
+                chunk_page = current_page
+
+        running_offset += len(paragraph) + 2
 
     if current_chunk.strip():
-        chunks.append(current_chunk.strip())
+        _flush()
 
-    valid = [c for c in chunks if c.strip()]
+    valid = [c for c in chunks if c.text.strip()]
 
     logger.info(
         "Structure-aware chunking completed: chunks=%d max_len=%d",
         len(valid),
-        max((len(c) for c in valid), default=0),
+        max((len(c.text) for c in valid), default=0),
     )
 
     return valid
